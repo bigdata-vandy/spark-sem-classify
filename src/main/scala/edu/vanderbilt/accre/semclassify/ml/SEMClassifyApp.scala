@@ -4,7 +4,9 @@ import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
 import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 import org.apache.spark.ml.feature.{IndexToString, StringIndexer, VectorAssembler}
-import org.apache.spark.sql.{DataFrame, SQLContext}
+import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder}
+import org.apache.spark.sql.{DataFrame, Row, SQLContext, SparkSession}
+
 
 /**
   * Created by joshuaarnold on 5/18/17.
@@ -21,20 +23,52 @@ object SEMClassifyApp {
     }
 
     val conf = new SparkConf()
-
     val sc = new SparkContext(conf)
 
-    val sqlContext = new SQLContext(sc)
+    val spark = SparkSession
+        .builder()
+        .appName("Classify SEM images with Spark")
+        .getOrCreate()
 
-    val data: DataFrame = sqlContext.read.format("json")
-        .load(input)
-        .cache()
+    // For implicit conversions like converting RDDs to DataFrames
+    import spark.implicits._
 
+    val allData: DataFrame = spark.read.json(input)
 
-    data.filter(!data("label").like("None") && !data("label").like(""))
+    // Select the manually-labeled data, leaving out soi_011 for testing
+    val data = allData.filter(
+      !allData("soi").like("%soi_011") &&
+          !allData("label").like("None") &&
+          !allData("label").like("")
+    ).cache()
 
-    // Split the data into training and test sets (30% held out for testing)
-    val Array(trainData, testData) = data.randomSplit(Array(0.7, 0.3))
+    // Pick up soi_001 for testing
+    val testData = allData.filter(
+      allData("soi").like("%soi_011") &&
+          !allData("label").like("None") &&
+          !allData("label").like("")
+    )
+
+    // Split the data into training and validation sets (30% held out for testing)
+    def stratifiedSample(df: DataFrame, col: String,
+                         splits: Array[Double]): Array[DataFrame] = {
+      val distinctLabels =
+        df.select(df(col)).distinct.collect.map{case Row(s: String) => s}
+
+      val emptyDF = spark.createDataFrame(sc.emptyRDD[Row], data.schema)
+      distinctLabels
+          .foldLeft(Array.fill(2)(emptyDF)){
+            case (a: Array[DataFrame], likeVal: String) => {
+              val b = df.filter(df(col).like(likeVal)).randomSplit(splits, 42L)
+              (a zip b).map { case (a1, b1) => a1.unionAll(b1) }
+            }
+          }.map(df1 =>
+              df1.sample(withReplacement = false, fraction = 1.0, seed = 42L)
+      )
+    }
+
+    val Array(trainData, validData) =
+      stratifiedSample(data, "label", Array(0.7, 0.3))
 
 
     // Assemble feature columns into a single column
@@ -53,7 +87,7 @@ object SEMClassifyApp {
     val rf = new RandomForestClassifier()
         .setLabelCol("indexedLabel")
         .setFeaturesCol("features")
-        .setNumTrees(10)
+        .setNumTrees(30)
 
     // Convert indexed labels back to original labels.
     val labelConverter = new IndexToString()
@@ -66,28 +100,53 @@ object SEMClassifyApp {
     val pipeline = new Pipeline()
         .setStages(Array(assembler, labelIndexer, rf, labelConverter))
 
+    // We use a ParamGridBuilder to construct a grid of parameters to search over.
+    // With 3 values for hashingTF.numFeatures and 2 values for lr.regParam,
+    // this grid will have 3 x 2 = 6 parameter settings for CrossValidator to choose from.
+    val paramGrid = new ParamGridBuilder()
+        .addGrid(rf.numTrees, Array(10, 30, 100))
+        .build()
 
-    // Train model.  This also runs the indexers.
-    val model = pipeline.fit(trainData)
-
-    // Evaluate the model
+    // Create evaluator
     val evaluator = new MulticlassClassificationEvaluator()
         .setLabelCol("indexedLabel")
         .setPredictionCol("prediction")
-        .setMetricName("precision")
+        .setMetricName("accuracy")
+
+    // We now treat the Pipeline as an Estimator, wrapping it in a CrossValidator instance.
+    // This will allow us to jointly choose parameters for all Pipeline stages.
+    // A CrossValidator requires an Estimator, a set of Estimator ParamMaps, and an Evaluator.
+    // Note that the evaluator here is a BinaryClassificationEvaluator and its default metric
+    // is areaUnderROC.
+    val cv = new CrossValidator()
+        .setEstimator(pipeline)
+        .setEvaluator(evaluator)
+        .setEstimatorParamMaps(paramGrid)
+        .setNumFolds(3)  // Use 3+ in practice
+
+    // Train model.  This also runs the indexers.
+    val cvModel = cv.fit(trainData)
+
 
     // Check train accuracy
-    val predictionsTrain = model.transform(trainData)
+    val predictionsTrain = cvModel.transform(trainData)
     val accuracyTrain = evaluator.evaluate(predictionsTrain)
 
+    // Check validation accuracy
+    val predictionsValid = cvModel.transform(validData)
+    val accuracyValid = evaluator.evaluate(predictionsValid)
+
     // Check test accuracy
-    val predictionsTest = model.transform(testData)
+    val predictionsTest= cvModel.transform(testData)
     val accuracyTest = evaluator.evaluate(predictionsTest)
 
-    println(s"Train Accuracy: $accuracyTrain\nTest Accuracy:  $accuracyTest")
 
-    val rfModel = model.stages(1).asInstanceOf[RandomForestClassificationModel]
-    println("Learned classification forest model:\n" + rfModel.toDebugString)
+    println(s"Train Accuracy: $accuracyTrain\n" +
+        s"Valid Accuracy: $accuracyValid\n" +
+        s"Test Accuracy:  $accuracyTest")
+
+    // val rfModel = model.stages(2).asInstanceOf[RandomForestClassificationModel]
+    // println("Learned classification forest model:\n" + rfModel.toDebugString)
 
   }
 
